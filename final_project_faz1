@@ -1,0 +1,149 @@
+# Gerekli kütüphaneleri kurun (imblearn sentetik veri üretimi içindir)
+!pip install librosa scikit-learn seaborn matplotlib pandas xgboost imbalanced-learn
+
+from google.colab import drive
+import os
+import librosa
+import numpy as np
+import warnings
+import xgboost as xgb
+from imblearn.over_sampling import SMOTE
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler, LabelEncoder
+from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import VotingClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+
+# 1. Drive Bağlantısı
+drive.mount('/content/drive', force_remount=True)
+DATASET_PATH = '/content/drive/MyDrive/Midterm_Dataset_2026'
+
+# 2. Etiket Eşleştirme
+def get_emotion_label(filename):
+    name = filename.lower()
+    if 'angry' in name or 'ofkeli' in name or 'öfkeli' in name: return 'Angry'
+    if 'happy' in name or 'mutlu' in name: return 'Happy'
+    if 'neutral' in name or 'notr' in name or 'nötr' in name: return 'Neutral'
+    if 'sad' in name or 'uzgun' in name or 'üzgün' in name: return 'Sad'
+    if 'surprised' in name or 'saskin' in name or 'şaşkın' in name: return 'Surprised'
+    return None
+
+# 3. YÜKSEK MÜHENDİSLİK ÖZNİTELİK ÇIKARIMI (Deltalar ve Kontrast Eklendi)
+def extract_elite_features(file_path):
+    try:
+        audio, sample_rate = librosa.load(file_path, sr=None) 
+        if len(audio) == 0: return None
+        audio, _ = librosa.effects.trim(audio)
+
+        # Temel Frekans Matrisi (STFT)
+        stft = np.abs(librosa.stft(audio))
+        
+        # A. MFCC ve Türevleri (Duygu değişimlerini yakalar - ÇOK KRİTİK)
+        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=40)
+        delta_mfccs = librosa.feature.delta(mfccs) # Sesin Hızı
+        delta2_mfccs = librosa.feature.delta(mfccs, order=2) # Sesin İvmesi (Titremeler)
+        
+        # B. Spektral Kontrast (Bağırma vs Normal konuşma ayrımı)
+        contrast = librosa.feature.spectral_contrast(S=stft, sr=sample_rate)
+        
+        # C. Chroma ve Mel (Tonalite ve İnsan işitme modeli)
+        chroma = librosa.feature.chroma_stft(S=stft, sr=sample_rate)
+        mel = librosa.feature.melspectrogram(y=audio, sr=sample_rate)
+
+        # Tüm özelliklerin SADECE Ortalama (Mean) ve Standart Sapmasını (Std) alarak 
+        # modelin kafasını karıştırmayacak en temiz ve güçlü vektörü oluşturuyoruz
+        features = np.hstack((
+            np.mean(mfccs, axis=1), np.std(mfccs, axis=1),
+            np.mean(delta_mfccs, axis=1), np.std(delta_mfccs, axis=1),
+            np.mean(delta2_mfccs, axis=1), np.std(delta2_mfccs, axis=1),
+            np.mean(contrast, axis=1), np.std(contrast, axis=1),
+            np.mean(chroma, axis=1), np.std(chroma, axis=1),
+            np.mean(mel, axis=1), np.std(mel, axis=1)
+        ))
+        return features
+        
+    except Exception as e:
+        return None
+
+# 4. VERİ YÜKLEME
+print("Elit öznitelikler çıkarılıyor (MFCC Deltaları ve Spektral Kontrast)...")
+features, labels = [], []
+
+for root, dirs, files in os.walk(DATASET_PATH):
+    for file in files:
+        if file.endswith('.wav'):
+            file_path = os.path.join(root, file)
+            label = get_emotion_label(file)
+            if label is not None:
+                data = extract_elite_features(file_path)
+                if data is not None:
+                    data = np.nan_to_num(data) # NaN hatalarını sıfırla
+                    features.append(data)
+                    labels.append(label)
+
+X = np.array(features)
+y = np.array(labels)
+print(f"Toplam işlenen ses dosyası: {len(X)}")
+
+# 5. ÖN İŞLEME (Sıradan Scaler yerine aykırı seslere dayanıklı RobustScaler)
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+
+# Veriyi böl
+X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
+
+# RobustScaler: Arkaplan gürültüsü olan, aniden patlayan seslere (outliers) karşı en dayanıklı ölçekleyicidir.
+scaler = RobustScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# 6. SENTETİK VERİ ÜRETİMİ (SMOTE) - %70'e çıkaran en önemli hamle
+print("SMOTE uygulanıyor: Eğitim verisindeki azınlık sınıflar sentetik olarak çoğaltılıp dengeleniyor...")
+smote = SMOTE(random_state=42)
+X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
+
+# 7. ŞAMPİYON MODELLERİN OYLAMASI (SVC + YSA + XGBoost)
+print("Modeller eğitiliyor...")
+
+# Model 1: SVC (Yüksek boyutlu ses verilerinde hala en iyilerden biri)
+svc = SVC(kernel='rbf', C=20, gamma='scale', probability=True, random_state=42)
+
+# Model 2: Derin Yapay Sinir Ağı Simülasyonu
+mlp = MLPClassifier(hidden_layer_sizes=(512, 256, 128), max_iter=600, alpha=0.001, random_state=42)
+
+# Model 3: XGBoost (Ağaç algoritmalarının kralı)
+xgb_model = xgb.XGBClassifier(n_estimators=400, learning_rate=0.05, max_depth=8, random_state=42)
+
+# Oylama Sistemi
+ensemble_model = VotingClassifier(
+    estimators=[('svc', svc), ('mlp', mlp), ('xgb', xgb_model)],
+    voting='soft'
+)
+
+ensemble_model.fit(X_train_balanced, y_train_balanced)
+
+# 8. SONUÇLAR
+y_pred_encoded = ensemble_model.predict(X_test_scaled)
+accuracy = accuracy_score(y_test, y_pred_encoded)
+
+y_test_labels = le.inverse_transform(y_test)
+y_pred_labels = le.inverse_transform(y_pred_encoded)
+
+print("\n" + "★"*50)
+print(f"HEDEF FAZ 1 - Model Doğruluk (Accuracy) Oranı: %{accuracy * 100:.2f}")
+print("★"*50 + "\n")
+print("Detaylı Sınıflandırma Raporu:\n", classification_report(y_test_labels, y_pred_labels))
+
+# Karmaşıklık Matrisi
+cm = confusion_matrix(y_test_labels, y_pred_labels, labels=le.classes_)
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='inferno', xticklabels=le.classes_, yticklabels=le.classes_)
+plt.title('SMOTE + Delta Elite Ensemble - Karmaşıklık Matrisi')
+plt.ylabel('Gerçek Değerler')
+plt.xlabel('Tahmin Edilen Değerler')
+plt.show()
