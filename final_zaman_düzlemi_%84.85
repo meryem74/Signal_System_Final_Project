@@ -1,0 +1,246 @@
+!pip install -q librosa scikit-learn seaborn matplotlib imbalanced-learn
+
+from google.colab import drive
+import os, warnings
+import librosa
+import numpy as np
+from scipy.stats import kurtosis, skew
+from imblearn.over_sampling import SMOTE
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler, LabelEncoder
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+drive.mount('/content/drive', force_remount=True)
+DATASET_PATH = '/content/drive/MyDrive/Midterm_Dataset_2026'
+
+# ── Etiket ──────────────────────────────────────────────────
+def get_emotion_label(filename):
+    name = filename.lower()
+    if 'angry'     in name or 'ofkeli' in name or 'öfkeli'  in name: return 'Angry'
+    if 'happy'     in name or 'mutlu'  in name:                       return 'Happy'
+    if 'neutral'   in name or 'notr'   in name or 'nötr'    in name:  return 'Neutral'
+    if 'sad'       in name or 'uzgun'  in name or 'üzgün'   in name:  return 'Sad'
+    if 'surprised' in name or 'saskin' in name or 'şaşkın'  in name:  return 'Surprised'
+    return None
+
+# ── FAZ 1: MAKSİMUM ZAMAN DÜZLEMİ ÖZNİTELİKLERİ ────────────
+# Kural: sadece zaman düzlemi (ZCR, Enerji, Pitch vb.)
+# Strateji: her öznitelikten 7 istatistik çıkar → vektörü genişlet
+def istatistik(x):
+    """7 istatistiksel ölçüm → zaman serisini tam tanımlar"""
+    x = np.array(x).flatten()
+    x = x[x > 0] if np.any(x > 0) else x  # sıfırları filtrele (pitch için)
+    if len(x) == 0: x = np.array([0.0])
+    return np.array([
+        np.mean(x),
+        np.std(x),
+        np.max(x),
+        np.min(x),
+        np.median(x),
+        kurtosis(x),   # dağılımın sivrilik derecesi
+        skew(x),       # dağılımın çarpıklığı
+    ])
+
+def extract_features(audio, sr):
+    frame_length = 2048
+    hop_length   = 512
+
+    # 1. ZCR — Sıfır Geçiş Oranı
+    zcr = librosa.feature.zero_crossing_rate(
+        audio, frame_length=frame_length, hop_length=hop_length)[0]
+
+    # 2. RMS Enerji
+    rms = librosa.feature.rms(
+        y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+
+    # 3. STE — Kısa Süreli Enerji (kare toplam)
+    ste = np.array([
+        np.sum(audio[i:i+frame_length]**2)
+        for i in range(0, len(audio) - frame_length, hop_length)
+    ], dtype=np.float32)
+
+    # 4. Pitch (YIN) — Temel frekans
+    f0 = librosa.yin(audio,
+                     fmin=librosa.note_to_hz('C2'),
+                     fmax=librosa.note_to_hz('C7'),
+                     frame_length=frame_length,
+                     hop_length=hop_length)
+    f0 = np.nan_to_num(f0)
+
+    # 5. Enerji Entropi — Sesin düzensizlik/değişkenlik ölçüsü
+    #    Öfkeli/şaşkın seslerde yüksek, nötr/üzgün seslerde düşük
+    eps = 1e-10
+    rms_norm = rms / (np.sum(rms) + eps)
+    energy_entropy = -np.sum(rms_norm * np.log(rms_norm + eps))
+
+    # 6. Otokorelasyon Peak — Periyodiklik/titreme ölçüsü
+    #    Sesli/neşeli seslerde güçlü periyodiklik
+    autocorr = np.correlate(audio, audio, mode='full')
+    autocorr = autocorr[len(autocorr)//2:]
+    autocorr = autocorr / (autocorr[0] + eps)
+    # İlk 500 örnek içindeki pik (temel frekans bölgesi)
+    ac_peak = np.max(autocorr[50:500]) if len(autocorr) > 500 else np.max(autocorr[1:])
+
+    # 7. Pitch Değişim Hızı — Duygu geçişlerinin hızı
+    #    Şaşkın/öfkeli = hızlı değişim, üzgün = yavaş değişim
+    voiced = f0[f0 > 0]
+    if len(voiced) > 1:
+        pitch_delta_mean = np.mean(np.abs(np.diff(voiced)))
+        pitch_delta_std  = np.std(np.abs(np.diff(voiced)))
+    else:
+        pitch_delta_mean = pitch_delta_std = 0.0
+
+    # 8. Konuşma Hızı Tahmini — Enerji geçişlerinden hız tahmini
+    #    Üzgün = yavaş, neşeli/şaşkın = hızlı
+    energy_crossings = np.sum(np.diff((rms > np.mean(rms)).astype(int)) != 0)
+
+    # 9. Sessizlik Oranı — Toplam sürede sessiz kare oranı
+    silence_ratio = np.sum(rms < 0.01) / (len(rms) + eps)
+
+    # 10. Dinamik Aralık — Max/Min enerji farkı (ses şiddeti değişimi)
+    dynamic_range = np.max(rms) - np.min(rms)
+
+    # Tüm özellikleri birleştir
+    features = np.hstack([
+        istatistik(zcr),          # 7
+        istatistik(rms),          # 7
+        istatistik(ste),          # 7
+        istatistik(f0),           # 7
+        [energy_entropy],         # 1
+        [ac_peak],                # 1
+        [pitch_delta_mean],       # 1
+        [pitch_delta_std],        # 1
+        [energy_crossings],       # 1
+        [silence_ratio],          # 1
+        [dynamic_range],          # 1
+    ])                            # Toplam: 35 boyut
+    return features
+
+# ── AUGMENTATION (3 varyant — kuralda yasak yok) ────────────
+def augment_audio(audio, sr):
+    variants = []
+    # Hafif gürültü
+    variants.append(audio + 0.004 * np.random.randn(len(audio)))
+    # Zaman gerdirme (yavaşlat)
+    stretched = librosa.effects.time_stretch(audio, rate=0.9)
+    variants.append(stretched[:len(audio)])
+    # Pitch kaydırma
+    variants.append(librosa.effects.pitch_shift(audio, sr=sr, n_steps=2))
+    return variants
+
+# ── VERİ YÜKLEME ─────────────────────────────────────────────
+print("Faz 1 öznitelikleri çıkarılıyor...")
+features, labels = [], []
+
+for root, dirs, files in os.walk(DATASET_PATH):
+    for file in sorted(files):
+        if not file.endswith('.wav'): continue
+        label = get_emotion_label(file)
+        if label is None: continue
+        try:
+            audio, sr = librosa.load(os.path.join(root, file), sr=22050)
+            if len(audio) < sr * 0.3: continue
+            audio, _ = librosa.effects.trim(audio, top_db=20)
+
+            # Orijinal
+            features.append(np.nan_to_num(extract_features(audio, sr)))
+            labels.append(label)
+
+            # Augmented
+            for aug in augment_audio(audio, sr):
+                features.append(np.nan_to_num(extract_features(aug, sr)))
+                labels.append(label)
+
+        except Exception as e:
+            print(f"  HATA: {file} → {e}")
+
+X = np.array(features)
+y = np.array(labels)
+print(f"Toplam örnek: {len(X)} | Öznitelik boyutu: {X.shape[1]}")
+print({c: int(np.sum(y==c)) for c in np.unique(y)})
+
+# ── ÖN İŞLEME ───────────────────────────────────────────────
+le = LabelEncoder()
+y_enc = le.fit_transform(y)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_enc, test_size=0.2, random_state=42, stratify=y_enc)
+
+scaler = RobustScaler()
+X_tr_sc = scaler.fit_transform(X_train)
+X_te_sc = scaler.transform(X_test)
+
+# SMOTE — azınlık sınıfları dengele
+smote = SMOTE(random_state=42)
+X_bal, y_bal = smote.fit_resample(X_tr_sc, y_train)
+print(f"SMOTE sonrası eğitim: {len(X_bal)} örnek")
+
+# ── ENSEMBLE MODEL ───────────────────────────────────────────
+# Faz 1 için makul: tek karmaşık model değil, birkaç klasik modelin oylaması
+print("Modeller eğitiliyor...")
+
+svm = SVC(kernel='rbf', C=50, gamma='scale',
+          probability=True, random_state=42)
+
+rf = RandomForestClassifier(
+    n_estimators=300, max_depth=None,
+    min_samples_split=2, random_state=42, n_jobs=-1)
+
+gb = GradientBoostingClassifier(
+    n_estimators=200, learning_rate=0.05,
+    max_depth=6, random_state=42)
+
+knn = KNeighborsClassifier(n_neighbors=5, weights='distance', n_jobs=-1)
+
+ensemble = VotingClassifier(
+    estimators=[('svm', svm), ('rf', rf), ('gb', gb), ('knn', knn)],
+    voting='soft',
+    n_jobs=-1
+)
+ensemble.fit(X_bal, y_bal)
+
+# ── SONUÇLAR ─────────────────────────────────────────────────
+y_pred = ensemble.predict(X_te_sc)
+acc    = accuracy_score(y_test, y_pred)
+
+y_test_lbl = le.inverse_transform(y_test)
+y_pred_lbl = le.inverse_transform(y_pred)
+
+print(f"\n{'★'*50}")
+print(f"  FAZ 1 ACCURACY: %{acc*100:.2f}")
+print(f"{'★'*50}\n")
+print(classification_report(y_test_lbl, y_pred_lbl))
+
+# Karmaşıklık Matrisi
+cm = confusion_matrix(y_test_lbl, y_pred_lbl, labels=le.classes_)
+plt.figure(figsize=(7, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=le.classes_, yticklabels=le.classes_)
+plt.title(f'FAZ 1 — Zaman Düzlemi + Ensemble | Accuracy: %{acc*100:.2f}')
+plt.ylabel('Gerçek'); plt.xlabel('Tahmin')
+plt.tight_layout(); plt.show()
+
+# Öznitelik önemi grafiği (rapor için)
+feat_names = (
+    ['ZCR_'   + s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['RMS_'   + s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['STE_'   + s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['Pitch_' + s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['EnerjiEntropy','AutocorrPeak','PitchDeltaMean','PitchDeltaStd',
+     'EnerjiGeçiş','SessizlikOranı','DinamikAralık']
+)
+importances = rf.feature_importances_
+idx = np.argsort(importances)[::-1]
+
+plt.figure(figsize=(12, 4))
+plt.bar(range(len(feat_names)), importances[idx], color='steelblue')
+plt.xticks(range(len(feat_names)),
+           [feat_names[i] for i in idx], rotation=60, ha='right', fontsize=8)
+plt.title('Faz 1 — Random Forest Öznitelik Önemi (Zaman Düzlemi)')
+plt.tight_layout(); plt.show()
