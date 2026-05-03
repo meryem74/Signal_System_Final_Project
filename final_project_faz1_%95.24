@@ -1,0 +1,187 @@
+!pip install -q librosa scikit-learn seaborn matplotlib imbalanced-learn
+
+from google.colab import drive
+import os, warnings
+import librosa
+import numpy as np
+from scipy.stats import kurtosis, skew
+from imblearn.over_sampling import SMOTE
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler, LabelEncoder
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+np.random.seed(42)
+
+drive.mount('/content/drive', force_remount=True)
+DATASET_PATH = '/content/drive/MyDrive/Midterm_Dataset_2026'
+
+def get_emotion_label(filename):
+    name = filename.lower()
+    if 'angry'     in name or 'ofkeli' in name or 'öfkeli'  in name: return 'Angry'
+    if 'happy'     in name or 'mutlu'  in name:                       return 'Happy'
+    if 'neutral'   in name or 'notr'   in name or 'nötr'    in name:  return 'Neutral'
+    if 'sad'       in name or 'uzgun'  in name or 'üzgün'   in name:  return 'Sad'
+    if 'surprised' in name or 'saskin' in name or 'şaşkın'  in name:  return 'Surprised'
+    return None
+
+def istatistik(x):
+    x = np.array(x).flatten()
+    x = x[x > 0] if np.any(x > 0) else x
+    if len(x) == 0: x = np.array([0.0])
+    return np.array([
+        np.mean(x), np.std(x), np.max(x), np.min(x),
+        np.median(x), float(kurtosis(x)), float(skew(x))
+    ])
+
+def extract_features(audio, sr):
+    frame_length = 2048
+    hop_length   = 512
+    eps = 1e-10
+
+    zcr = librosa.feature.zero_crossing_rate(
+            audio, frame_length=frame_length, hop_length=hop_length)[0]
+    rms = librosa.feature.rms(
+            y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+    ste = np.array([
+            np.sum(audio[i:i+frame_length]**2)
+            for i in range(0, len(audio)-frame_length, hop_length)
+          ], dtype=np.float32)
+    f0 = librosa.yin(audio,
+                     fmin=librosa.note_to_hz('C2'),
+                     fmax=librosa.note_to_hz('C7'),
+                     frame_length=frame_length,
+                     hop_length=hop_length)
+    f0 = np.nan_to_num(f0)
+
+    rms_norm         = rms / (np.sum(rms) + eps)
+    energy_entropy   = -np.sum(rms_norm * np.log(rms_norm + eps))
+    voiced           = f0[f0 > 0]
+    pitch_delta_mean = np.mean(np.abs(np.diff(voiced))) if len(voiced) > 1 else 0.0
+    pitch_delta_std  = np.std(np.abs(np.diff(voiced)))  if len(voiced) > 1 else 0.0
+    energy_crossings = float(np.sum(np.diff((rms > np.mean(rms)).astype(int)) != 0))
+    silence_ratio    = float(np.sum(rms < 0.01) / (len(rms) + eps))
+    dynamic_range    = float(np.max(rms) - np.min(rms))
+
+    mfccs  = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=40)
+    d_mfcc = librosa.feature.delta(mfccs)
+
+    return np.nan_to_num(np.hstack([
+        istatistik(zcr), istatistik(rms), istatistik(ste), istatistik(f0),
+        [energy_entropy, pitch_delta_mean, pitch_delta_std,
+         energy_crossings, silence_ratio, dynamic_range],
+        np.mean(mfccs, axis=1), np.std(mfccs, axis=1),
+        np.mean(d_mfcc, axis=1), np.std(d_mfcc, axis=1),
+    ]))
+
+def augment_audio(audio, seed):
+    rng = np.random.RandomState(seed)  # her dosya farklı ama sabit seed
+    return [audio + 0.004 * rng.randn(len(audio))]
+
+print("Öznitelikler çıkarılıyor...")
+features, labels = [], []
+count = 0
+
+for root, dirs, files in os.walk(DATASET_PATH):
+    for file in sorted(files):
+        if not file.endswith('.wav'): continue
+        label = get_emotion_label(file)
+        if label is None: continue
+        try:
+            audio, sr = librosa.load(os.path.join(root, file), sr=16000)
+            if len(audio) < sr * 0.3: continue
+            audio, _ = librosa.effects.trim(audio, top_db=20)
+
+            features.append(extract_features(audio, sr))
+            labels.append(label)
+            for aug in augment_audio(audio, seed=count):
+                features.append(extract_features(aug, sr))
+                labels.append(label)
+
+            count += 1
+            if count % 50 == 0:
+                print(f"  {count} dosya işlendi...")
+
+        except Exception as e:
+            print(f"  HATA: {file} → {e}")
+
+X = np.array(features)
+y = np.array(labels)
+print(f"\nToplam örnek: {len(X)} | Boyut: {X.shape[1]}")
+print({c: int(np.sum(y==c)) for c in np.unique(y)})
+
+le = LabelEncoder()
+y_enc = le.fit_transform(y)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_enc, test_size=0.2, random_state=42, stratify=y_enc)
+
+scaler = RobustScaler()
+X_tr_sc = scaler.fit_transform(X_train)
+X_te_sc = scaler.transform(X_test)
+
+smote = SMOTE(random_state=42)
+X_bal, y_bal = smote.fit_resample(X_tr_sc, y_train)
+print(f"SMOTE sonrası: {len(X_bal)} örnek")
+
+print("Modeller eğitiliyor...")
+svm = SVC(kernel='rbf', C=50, gamma='scale', probability=True, random_state=42)
+rf  = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+gb  = GradientBoostingClassifier(n_estimators=100, learning_rate=0.05,
+                                  max_depth=5, random_state=42)
+knn = KNeighborsClassifier(n_neighbors=5, weights='distance', n_jobs=-1)
+
+ensemble = VotingClassifier(
+    estimators=[('svm', svm), ('rf', rf), ('gb', gb), ('knn', knn)],
+    voting='soft', n_jobs=-1
+)
+ensemble.fit(X_bal, y_bal)
+
+y_pred     = ensemble.predict(X_te_sc)
+acc        = accuracy_score(y_test, y_pred)
+y_test_lbl = le.inverse_transform(y_test)
+y_pred_lbl = le.inverse_transform(y_pred)
+
+print(f"\n{'★'*50}")
+print(f"  FAZ 1 ACCURACY: %{acc*100:.2f}")
+print(f"{'★'*50}\n")
+print(classification_report(y_test_lbl, y_pred_lbl))
+
+cm = confusion_matrix(y_test_lbl, y_pred_lbl, labels=le.classes_)
+plt.figure(figsize=(7, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=le.classes_, yticklabels=le.classes_)
+plt.title(f'FAZ 1 — MFCC + Zaman Düzlemi + Ensemble | Accuracy: %{acc*100:.2f}')
+plt.ylabel('Gerçek'); plt.xlabel('Tahmin')
+plt.tight_layout(); plt.show()
+
+# Öznitelik Önemi
+rf_fitted = ensemble.named_estimators_['rf']
+
+zaman_names = (
+    ['ZCR_'  +s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['RMS_'  +s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['STE_'  +s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['Pitch_'+s for s in ['mean','std','max','min','med','kurt','skew']] +
+    ['EEntropy','PΔmean','PΔstd','EGeçiş','Sessizlik','DinAralık']
+)
+mfcc_names = ([f'MFCC{i}_mean'  for i in range(40)] +
+              [f'MFCC{i}_std'   for i in range(40)] +
+              [f'dMFCC{i}_mean' for i in range(40)] +
+              [f'dMFCC{i}_std'  for i in range(40)])
+feat_names = zaman_names + mfcc_names
+
+importances = rf_fitted.feature_importances_
+idx = np.argsort(importances)[::-1][:20]
+
+plt.figure(figsize=(12, 4))
+plt.bar(range(20), importances[idx], color='steelblue')
+plt.xticks(range(20), [feat_names[i] for i in idx],
+           rotation=55, ha='right', fontsize=9)
+plt.title('Faz 1 — En Önemli 20 Öznitelik (Random Forest)')
+plt.tight_layout(); plt.show()
